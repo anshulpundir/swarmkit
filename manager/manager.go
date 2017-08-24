@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/go-events"
+	gmetrics "github.com/docker/go-metrics"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/ca"
 	"github.com/docker/swarmkit/connectionbroker"
@@ -45,6 +45,7 @@ import (
 	gogotypes "github.com/gogo/protobuf/types"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -162,6 +163,16 @@ type Manager struct {
 	remoteListener  chan net.Listener
 	controlListener chan net.Listener
 	errServe        chan error
+}
+
+var (
+	leaderMetric gmetrics.Gauge
+)
+
+func init() {
+	ns := gmetrics.NewNamespace("swarm", "manager", nil)
+	leaderMetric = ns.NewGauge("leader", "Indicates if this manager node is a leader", "")
+	gmetrics.Register(ns)
 }
 
 type closeOnceListener struct {
@@ -873,8 +884,10 @@ func (m *Manager) handleLeadershipEvents(ctx context.Context, leadershipCh chan 
 
 			if newState == raft.IsLeader {
 				m.becomeLeader(ctx)
+				leaderMetric.Set(1)
 			} else if newState == raft.IsFollower {
 				m.becomeFollower()
+				leaderMetric.Set(0)
 			}
 			m.mu.Unlock()
 		case <-ctx.Done():
