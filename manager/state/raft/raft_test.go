@@ -3,6 +3,8 @@ package raft_test
 import (
 	"errors"
 	"fmt"
+	"github.com/coreos/etcd/raft/raftpb"
+	"github.com/docker/swarmkit/manager/state/raft/transport"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -948,4 +950,51 @@ func TestStress(t *testing.T) {
 		}
 		assert.True(t, find)
 	}
+}
+
+func GetSnapshotMessage(from, to uint64, size int) *raftpb.Message {
+	data := make([]byte, size)
+	for i := 0; i < size; i++ {
+		data[i] = byte(i % (1 << 8))
+	}
+
+	return &raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: from,
+		To:   to,
+		Snapshot: raftpb.Snapshot{
+			Data: data,
+		},
+	}
+}
+
+// Test the server side code for raft snapshot streaming.
+func TestRaftMessageStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	nodes, _ := raftutils.NewRaftCluster(t, tc)
+	defer raftutils.TeardownCluster(nodes)
+
+	cc, err := dial(nodes[1], nodes[1].Address)
+	assert.NoError(t, err)
+
+	stream, err := api.NewRaftClient(cc).RaftMessageStream(ctx)
+	assert.NoError(t, err)
+
+	err = stream.Send(&api.ProcessRaftMessageRequest{Message: GetSnapshotMessage(2, 1, transport.MaxRaftMsgSize/2)})
+	assert.NoError(t, err)
+	_, err = stream.CloseAndRecv()
+	assert.NoError(t, err)
+
+	stream, err = api.NewRaftClient(cc).RaftMessageStream(ctx)
+	assert.NoError(t, err)
+
+	msg := GetSnapshotMessage(2, 1, transport.MaxRaftMsgSize)
+	err = stream.Send(&api.ProcessRaftMessageRequest{Message: msg})
+	assert.Error(t, err, "Received unexpected error EOF")
+
+	_, err = stream.CloseAndRecv()
+	errStr := fmt.Sprintf("rpc error: code = Internal desc = grpc: received message length %d exceeding the max size %d", msg.Size(), transport.MaxRaftMsgSize)
+	assert.Error(t, err, errStr)
 }

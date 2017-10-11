@@ -1,6 +1,8 @@
 package transport
 
 import (
+	"github.com/docker/swarmkit/log"
+	"io"
 	"net"
 	"time"
 
@@ -93,6 +95,44 @@ func (r *mockRaft) ProcessRaftMessage(ctx context.Context, req *api.ProcessRaftM
 	}
 	r.processedMessages <- req.Message
 	return &api.ProcessRaftMessageResponse{}, nil
+}
+
+// RaftMessageStream is the mock server endpoint for streaming messages of type ProcessRaftMessageRequest.
+func (r *mockRaft) RaftMessageStream(stream api.Raft_RaftMessageStreamServer) error {
+	var recvdMsg, assembledMessage *api.ProcessRaftMessageRequest
+	var err error
+	for {
+		recvdMsg, err = stream.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.G(context.Background()).WithError(err).Error("error while reading from stream")
+			return err
+		}
+
+		if assembledMessage == nil {
+			assembledMessage = recvdMsg
+			continue
+		}
+
+		// Append received snapshot chunk to the chunk that was already received.
+		if recvdMsg.Message.Type == raftpb.MsgSnap {
+			assembledMessage.Message.Snapshot.Data = append(assembledMessage.Message.Snapshot.Data, recvdMsg.Message.Snapshot.Data...)
+		}
+	}
+
+	// We should have the complete snapshot. Verify and process.
+	if err == io.EOF {
+		if !verifySnapshot(assembledMessage.Message) {
+			log.G(context.Background()).Error("snapshot data mismatch")
+			panic("invalid snapshot data")
+		}
+
+		r.processedMessages <- assembledMessage.Message
+		return stream.SendAndClose(&api.ProcessRaftMessageResponse{})
+	}
+
+	return nil
 }
 
 func (r *mockRaft) ResolveAddress(ctx context.Context, req *api.ResolveAddressRequest) (*api.ResolveAddressResponse, error) {

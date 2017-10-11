@@ -9257,6 +9257,17 @@ file {
       }
     }
     method {
+      name: "RaftMessageStream"
+      input_type: ".docker.swarmkit.v1.ProcessRaftMessageRequest"
+      output_type: ".docker.swarmkit.v1.ProcessRaftMessageResponse"
+      options {
+        73626345 {
+          1: "swarm-manager"
+        }
+      }
+      client_streaming: true
+    }
+    method {
       name: "ResolveAddress"
       input_type: ".docker.swarmkit.v1.ResolveAddressRequest"
       output_type: ".docker.swarmkit.v1.ResolveAddressResponse"

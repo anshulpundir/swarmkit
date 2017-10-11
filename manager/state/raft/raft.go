@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -487,7 +488,7 @@ func DefaultNodeConfig() *raft.Config {
 func DefaultRaftConfig() api.RaftConfig {
 	return api.RaftConfig{
 		KeepOldSnapshots:           0,
-		SnapshotInterval:           10000,
+		SnapshotInterval:           100,
 		LogEntriesForSlowFollowers: 500,
 		ElectionTick:               3,
 		HeartbeatTick:              1,
@@ -1300,6 +1301,43 @@ func (n *Node) reportNewAddress(ctx context.Context, id uint64) error {
 	}
 	newAddr := net.JoinHostPort(newHost, officialPort)
 	return n.transport.UpdatePeerAddr(id, newAddr)
+}
+
+// RaftMessageStream is the server endpoint for streaming Raft messages.
+func (n *Node) RaftMessageStream(stream api.Raft_RaftMessageStreamServer) error {
+	var recvdMsg, assembledMessage *api.ProcessRaftMessageRequest
+	var err error
+	for {
+		recvdMsg, err = stream.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.G(context.Background()).WithError(err).Error("error while reading from stream")
+			return err
+		}
+
+		if assembledMessage == nil {
+			assembledMessage = recvdMsg
+			continue
+		}
+
+		// Append the received snapshot data.
+		if recvdMsg.Message.Type == raftpb.MsgSnap {
+			assembledMessage.Message.Snapshot.Data = append(assembledMessage.Message.Snapshot.Data, recvdMsg.Message.Snapshot.Data...)
+		} else {
+			log.G(context.Background()).Errorf("Ignoring unexpected message type received on stream: %d", recvdMsg.Message.Type)
+		}
+	}
+
+	// We should have the complete snapshot. Verify and process.
+	if err == io.EOF {
+		_, err = n.ProcessRaftMessage(context.Background(), assembledMessage)
+		if err == nil {
+			return stream.SendAndClose(&api.ProcessRaftMessageResponse{})
+		}
+	}
+
+	return err
 }
 
 // ProcessRaftMessage calls 'Step' which advances the

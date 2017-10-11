@@ -16,6 +16,13 @@ service Raft {
 		option (docker.protobuf.plugin.tls_authorization) = { roles: "swarm-manager" };
 	};
 
+	// RaftMessageStream returns a gRPC stream that can be used to stream raft messages
+	// to be processed on a raft member.
+	// It is called from the RaftMember willing to send a message to its destination ('To' field)
+	rpc RaftMessageStream(stream ProcessRaftMessageRequest) returns (ProcessRaftMessageResponse) {
+		option (docker.protobuf.plugin.tls_authorization) = { roles: "swarm-manager" };
+	};
+
 	// ResolveAddress returns the address where the node with the given ID can be reached.
 	rpc ResolveAddress(ResolveAddressRequest) returns (ResolveAddressResponse) {
 		option (docker.protobuf.plugin.tls_authorization) = { roles: "swarm-manager" };

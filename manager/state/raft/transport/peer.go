@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -17,6 +19,15 @@ import (
 	"github.com/docker/swarmkit/manager/state/raft/membership"
 	"github.com/pkg/errors"
 )
+
+var (
+	// MaxRaftMsgSize is the max raft message size.
+	MaxRaftMsgSize int
+)
+
+func init() {
+	MaxRaftMsgSize = 4<<20 + binary.Size(api.ProcessRaftMessageRequest{})
+}
 
 type peer struct {
 	id uint64
@@ -132,6 +143,56 @@ func (p *peer) resolveAddr(ctx context.Context, id uint64) (string, error) {
 	return resp.Addr, nil
 }
 
+// Returns the raft message struct size (not including the payload size) for the given raftpb.Message.
+// The payload is typically the snapshot or append entries.
+func raftMessageStructSize(m *raftpb.Message) int {
+	return (&api.ProcessRaftMessageRequest{Message: m}).Size() - len(m.Snapshot.Data)
+}
+
+// Returns the max allowable payload based on MaxRaftMsgSize and
+// the struct size for the given raftpb.Message and
+func raftMessagePayloadSize(m *raftpb.Message) int {
+	return MaxRaftMsgSize - raftMessageStructSize(m)
+}
+
+// Split a large raft message into smaller messages.
+// Currently this means splitting the []Snapshot.Data into chunks whose size
+// is dictacted by MaxRaftMsgSize.
+func splitSnapshotData(ctx context.Context, m *raftpb.Message) []api.ProcessRaftMessageRequest {
+	var messages []api.ProcessRaftMessageRequest
+	if m.Type != raftpb.MsgSnap {
+		return messages
+	}
+
+	// get the size of the data to be split.
+	size := len(m.Snapshot.Data)
+
+	// Get the max payload size.
+	payloadSize := raftMessagePayloadSize(m)
+
+	// split the snpashot into smaller messages.
+	for snapDataIndex := 0; snapDataIndex < size; {
+		remainingSize := size - snapDataIndex
+		chunkSize := int(math.Min(float64(remainingSize), float64(payloadSize)))
+
+		// allocate a new slice for the snapshot data chunk
+		raftMsg := *m
+		raftMsg.Snapshot.Data = make([]byte, chunkSize)
+
+		// copy snapshot data chunk
+		for chunkIndex := 0; chunkIndex < chunkSize; chunkIndex++ {
+			raftMsg.Snapshot.Data[chunkIndex] = m.Snapshot.Data[snapDataIndex]
+			snapDataIndex++
+		}
+
+		// add message to the list of messages to be sent.
+		msg := api.ProcessRaftMessageRequest{Message: &raftMsg}
+		messages = append(messages, msg)
+	}
+
+	return messages
+}
+
 func (p *peer) sendProcessMessage(ctx context.Context, m raftpb.Message) error {
 	timeout := p.tr.config.SendTimeout
 	// if a snapshot is being sent, set timeout to LargeSendTimeout because
@@ -142,7 +203,35 @@ func (p *peer) sendProcessMessage(ctx context.Context, m raftpb.Message) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, err := api.NewRaftClient(p.conn()).ProcessRaftMessage(ctx, &api.ProcessRaftMessageRequest{Message: &m})
+
+	var err error
+	if needsStreaming(&m) {
+		// stream message if its bigger than MaxRaftMsgSize.
+		var stream api.Raft_RaftMessageStreamClient
+		stream, err = api.NewRaftClient(p.conn()).RaftMessageStream(ctx)
+		if err == nil {
+			// split message
+			msgs := splitSnapshotData(ctx, &m)
+			for _, msg := range msgs {
+				err = stream.Send(&msg)
+				if err != nil {
+					log.G(ctx).WithError(err).Error("failed to stream message")
+				}
+			}
+			_, err = stream.CloseAndRecv()
+
+			// TODO(anshul) Check if Unimplemented and bubble up the error.
+			if err != nil {
+				log.G(ctx).WithError(err).Error("error receiving response on stream close")
+				return err
+			}
+		} else {
+			log.G(ctx).WithError(err).Error("failed to create stream!")
+		}
+	} else {
+		_, err = api.NewRaftClient(p.conn()).ProcessRaftMessage(ctx, &api.ProcessRaftMessageRequest{Message: &m})
+	}
+
 	if grpc.Code(err) == codes.NotFound && grpc.ErrorDesc(err) == membership.ErrMemberRemoved.Error() {
 		p.tr.config.NodeRemoved()
 	}
@@ -245,6 +334,17 @@ func (p *peer) handleAddressChange(ctx context.Context) error {
 	p.tr.config.UpdateNode(p.id, p.addr)
 	p.mu.Unlock()
 	return nil
+}
+
+// Function to check if streaming is needed.
+// Returns true if the message type is MsgSnap/MsgApp
+// and size larger than MaxRaftMsgSize.
+func needsStreaming(m *raftpb.Message) bool {
+	if m.Type == raftpb.MsgProp && m.Size() > MaxRaftMsgSize {
+		return true
+	}
+
+	return false
 }
 
 func (p *peer) run(ctx context.Context) {
